@@ -3517,6 +3517,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "alias for Gemma 4 MTP: path to gemma4_assistant GGUF (loaded into the target; use with --spec-type mtp)",
         [](common_params & params, const std::string & value) {
             params.speculative.mparams_dft.path = value;
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
     add_opt(common_arg(
