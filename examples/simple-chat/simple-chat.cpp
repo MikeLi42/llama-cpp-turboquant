@@ -1,10 +1,18 @@
 #include "llama.h"
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
+
+static char * my_strdup(const char * s) {
+    size_t len = strlen(s);
+    char * d = (char *)malloc(len + 1);
+    if (d) memcpy(d, s, len + 1);
+    return d;
+}
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -170,7 +178,7 @@ int main(int argc, char ** argv) {
         const char * tmpl = llama_model_chat_template(model, /* name */ nullptr);
 
         // add the user input to the message list and format it
-        messages.push_back({"user", strdup(user.c_str())});
+        messages.push_back({"user", my_strdup(user.c_str())});
         int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
         if (new_len > (int)formatted.size()) {
             formatted.resize(new_len);
@@ -190,7 +198,7 @@ int main(int argc, char ** argv) {
         printf("\n\033[0m");
 
         // add the response to the messages
-        messages.push_back({"assistant", strdup(response.c_str())});
+        messages.push_back({"assistant", my_strdup(response.c_str())});
         prev_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), false, nullptr, 0);
         if (prev_len < 0) {
             fprintf(stderr, "failed to apply the chat template\n");
