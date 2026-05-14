@@ -84,6 +84,17 @@ std::string gen_tool_call_id() {
     return random_string();
 }
 
+const char * get_media_marker() {
+    static const std::string marker = []() {
+        const char * env = getenv("LLAMA_MEDIA_MARKER");
+        if (env && env[0] != '\0') {
+            return std::string(env);
+        }
+        return std::string("<__media_") + random_string() + "__>";
+    }();
+    return marker.c_str();
+}
+
 //
 // lora utils
 //
