@@ -103,7 +103,7 @@ llm_build_qwen35moe_nextn::llm_build_qwen35moe_nextn(
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     cur = build_attn(inp_attn,
-            nullptr, nullptr,
+            nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "nextn_attn_pregate", il);
 

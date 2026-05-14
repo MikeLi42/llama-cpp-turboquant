@@ -862,17 +862,6 @@ std::string common_get_model_endpoint();
 // Context utils
 //
 
-enum common_context_seq_rm_type {
-    COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
-    COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
-    COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
-};
-
-// check if the llama_context can remove sequences
-// note: clears the memory of the context
-common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
-
-
 // Whether the context can partially remove sequence cells (affects speculative rollback).
 enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
