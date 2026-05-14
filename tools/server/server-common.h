@@ -192,7 +192,7 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_tokens() const;
 
-    llama_tokens get_text_tokens() const;
+    const llama_tokens & get_text_tokens() const;
 
     // Replace LLAMA_TOKEN_NULL (mtmd media placeholders) for callers that need a flat token stream
     // (e.g. Qwen NextN speculative begin / prime). Text tokens are unchanged.
