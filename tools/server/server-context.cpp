@@ -913,7 +913,7 @@ private:
             slot.ctx_seq_rm_type = ctx_seq_rm_global;
 
             slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.prompt.tokens.has_mtmd = false;
 
             // try speculative decoding
             if (can_spec) {
@@ -2484,6 +2484,7 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                slot.prompt.tokens.has_mtmd = false;
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -2612,6 +2613,10 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        if (n_past == 0) {
+                            slot.prompt.tokens.has_mtmd = false;
+                        }
+
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -2711,6 +2716,7 @@ private:
                         }
 
                         has_mtmd = true;
+                        slot.prompt.tokens.has_mtmd = true;
                     }
 
                     // Qwen NextN draft prime requires per-token pre-norm hidden states from
