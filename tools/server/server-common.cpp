@@ -417,6 +417,7 @@ void server_tokens::keep_first(size_t n) {
     GGML_ASSERT(n <= tokens.size());
     if (has_mtmd) {
         if (n == tokens.size()) {
+            has_mtmd = !map_idx_to_media.empty();
             return; // nothing to do
         }
         // we throw an error if we try to remove a token in the middle of an image
@@ -444,6 +445,7 @@ void server_tokens::keep_first(size_t n) {
         }
     }
     tokens.resize(n);
+    has_mtmd = !map_idx_to_media.empty();
 }
 
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
@@ -741,7 +743,15 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
-    auto result = server_tokens(chunks, true);
+    bool has_mtmd = false;
+    for (size_t i = 0; i < chunks.size(); i++) {
+        auto type = mtmd_input_chunk_get_type(chunks[i]);
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            has_mtmd = true;
+            break;
+        }
+    }
+    auto result = server_tokens(chunks, has_mtmd);
     return result;
 }
 

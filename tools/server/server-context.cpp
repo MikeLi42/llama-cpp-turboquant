@@ -2612,6 +2612,10 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        if (slot.task->tokens.has_mtmd) {
+                            slot.prompt.tokens.has_mtmd = true;
+                        }
+
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream && slot.task->params.return_progress) {
