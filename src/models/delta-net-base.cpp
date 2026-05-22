@@ -580,14 +580,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         return output;
     }
 
-    const int64_t D = S_v * S_v * H_v;
-    const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-
-    // TODO: remove pad + simplify
-    ggml_tensor * state_in_3d = ggml_reshape_3d(ctx0, s, D, 1, n_seqs);
-    ggml_tensor * state_3d    = ggml_pad(ctx0, state_in_3d, 0, K - 1, 0, 0);
-
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, state_3d);
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*keep_intermediates=*/false);
     cb(gdn_out, LLAMA_TENSOR_NAME_FGDN_CH, il);
 
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
