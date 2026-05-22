@@ -166,6 +166,8 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_MTP,           // Gemma 4 MTP assistant drafter
+    COMMON_SPECULATIVE_TYPE_NEXTN,         // Qwen3.x NextN second-context draft (same GGUF, arch override)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -307,8 +309,16 @@ struct common_params_speculative_draft {
 
     common_params_model mparams;
 
-    llama_context * ctx_tgt = nullptr;
-    llama_context * ctx_dft = nullptr;
+    int32_t n_max   = 16; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
+
+    // MTP (Gemma 4 assistant): draft block size B produces B-1 draft tokens per round.
+    // Default 3 (= 2 chained MTP draft steps): empirically the universal sweet spot for
+    // both f16 and turbo3 KV cache types after the chained MTP draft optimization
+    // (see docs/speculative.md and bench-block-size scripts).
+    int32_t draft_block_size = 3;
+    float   p_split = 0.1f; // speculative decoding split probability
+    float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -891,21 +901,15 @@ std::string common_get_model_endpoint();
 // Context utils
 //
 
+// Whether the context can partially remove sequence cells (affects speculative rollback).
 enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
     COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
     COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
-    COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED = 3, // can seq_rm partial sequences, bounded by n_rs_seq
 };
 
-// check if the llama_context can remove sequences
-// note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
-
-// aborts execution on failure
-void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
-void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
 //
 // Batch utils

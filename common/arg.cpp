@@ -3621,45 +3621,70 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg(
-        {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
-        "draft model for speculative decoding (default: unused)",
+        {"-md", "--model-draft"}, "FNAME",
+        "draft model for speculative decoding, Gemma 4 MTP assistant GGUF when using --spec-type mtp, or same main-model GGUF for Qwen NextN with --spec-type nextn (default: unused)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.mparams.path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
-        {"--spec-type"}, common_speculative_all_types_str(),
-        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
-            common_speculative_type_name_str(params.speculative.types).c_str()),
+        {"--mtp-head"}, "FNAME",
+        "alias for Gemma 4 MTP: path to gemma4_assistant GGUF (loaded into the target; use with --spec-type mtp)",
         [](common_params & params, const std::string & value) {
-            const auto types_str = string_split<std::string>(value, ',');
-            auto types = common_speculative_types_from_names(types_str);
-            params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            params.speculative.mparams_dft.path = value;
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
+    add_opt(common_arg(
+        {"--spec-replace"}, "TARGET", "DRAFT",
+        "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
+        [](common_params & params, const std::string & tgt, const std::string & dft) {
+            params.speculative.replacements.push_back({ tgt, dft });
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-type"}, "[none|draft|mtp|nextn|eagle3|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding (default: %s). For Gemma 4 MTP use --spec-type mtp and --mtp-head (or --model-draft) pointing at gemma4_assistant GGUF. For Qwen3 NextN use --spec-type nextn and --model-draft with the same GGUF as the target (second load uses llama_model_params.override_arch).\n",
+            common_speculative_type_to_str(params.speculative.type).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            } else if (value == "draft") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;
+            } else if (value == "mtp") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+            } else if (value == "nextn") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NEXTN;
+            } else if (value == "eagle3") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_EAGLE3;
+            } else if (value == "ngram-cache") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+            } else if (value == "ngram-simple") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+            } else if (value == "ngram-map-k") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K;
+            } else if (value == "ngram-map-k4v") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+            } else if (value == "ngram-mod") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            } else {
+                throw std::invalid_argument("unknown speculative decoding type");
+            }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
-        {"--spec-ngram-mod-n-min"}, "N",
-        string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
+        {"--draft-block-size"}, "N",
+        string_format("MTP draft block size B (drafts B-1 tokens per round; default: %d)", params.speculative.draft_block_size),
         [](common_params & params, int value) {
-            if (value < 0 || value > 1024) {
-                throw std::invalid_argument("ngram n-min must be between 0 and 1024 inclusive");
+            if (value < 2 || value > 32) {
+                throw std::invalid_argument("draft block size must be between 2 and 32");
             }
-            params.speculative.ngram_mod.n_min = value;
+            params.speculative.draft_block_size = value;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_BLOCK_SIZE"));
     add_opt(common_arg(
-        {"--spec-ngram-mod-n-max"}, "N",
-        string_format("maximum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_max),
-        [](common_params & params, int value) {
-            if (value < 0 || value > 1024) {
-                throw std::invalid_argument("ngram n-max must be between 0 and 1024 inclusive");
-            }
-            params.speculative.ngram_mod.n_max = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"--spec-ngram-mod-n-match"}, "N",
-        string_format("ngram-mod lookup length (default: %d)", params.speculative.ngram_mod.n_match),
+        {"--spec-ngram-size-n"}, "N",
+        string_format("ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_size_n),
         [](common_params & params, int value) {
             if (value < 1 || value > 1024) {
                 throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");

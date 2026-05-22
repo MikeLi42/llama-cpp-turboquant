@@ -56,6 +56,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // fused op with keep_intermediates=true: returns the raw [attn | T snapshots]
+    // output tensor. Caller slices snapshot views and routes them to recurrent slots.
+    ggml_tensor * build_delta_net_fused_keep_intermediates(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
@@ -705,17 +716,16 @@ struct llama_model_minicpm3 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Gemma 4 MTP: target model supplies tok_embd rows + KV; mtp_model supplies assistant weights.
+struct llm_build_gemma4_mtp : public llm_graph_context {
+    const llama_model & target;
+    const llama_model & mtp;
 
-struct llama_model_gemma : public llama_model_base {
-    llama_model_gemma(const struct llama_model_params & params) : llama_model_base(params) {}
-    void load_arch_hparams(llama_model_loader & ml) override;
-    void load_arch_tensors(llama_model_loader & ml) override;
+    llm_build_gemma4_mtp(const llama_model & target, const llama_model & mtp_model, const llm_graph_params & params);
+};
 
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
-    };
-
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+struct llm_build_gemma_embedding : public llm_graph_context {
+    llm_build_gemma_embedding(const llama_model & model, const llm_graph_params & params);
 };
 
 
@@ -1481,16 +1491,17 @@ struct llama_model_ernie4_5 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Qwen3.6 NextN draft head (standalone context, KV on tail layers only; GGUF arch: qwen35_mtp / qwen35moe_mtp)
+struct llm_build_qwen35_nextn : public llm_graph_context {
+    llm_build_qwen35_nextn(const llama_model & model, const llm_graph_params & params);
+};
 
-struct llama_model_ernie4_5_moe : public llama_model_ernie4_5 {
-    llama_model_ernie4_5_moe(const struct llama_model_params & params) : llama_model_ernie4_5(params) {}
-    // reuse load_arch_hparams and load_arch_tensors from llama_model_ernie4_5
+struct llm_build_qwen35moe_nextn : public llm_graph_context {
+    llm_build_qwen35moe_nextn(const llama_model & model, const llm_graph_params & params);
+};
 
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
-    };
-
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+struct llm_build_qwen : public llm_graph_context {
+    llm_build_qwen(const llama_model & model, const llm_graph_params & params);
 };
 
 

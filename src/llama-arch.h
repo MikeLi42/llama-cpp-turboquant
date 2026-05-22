@@ -45,6 +45,8 @@ enum llm_arch {
     LLM_ARCH_QWEN3VLMOE,
     LLM_ARCH_QWEN35,
     LLM_ARCH_QWEN35MOE,
+    LLM_ARCH_QWEN35_NEXTN,
+    LLM_ARCH_QWEN35MOE_NEXTN,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -61,6 +63,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA3,
     LLM_ARCH_GEMMA3N,
     LLM_ARCH_GEMMA4,
+    LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_GEMMA_EMBEDDING,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
@@ -344,6 +347,14 @@ enum llm_kv {
     LLM_KV_DENSE_2_FEAT_OUT,
     LLM_KV_DENSE_3_FEAT_IN,
     LLM_KV_DENSE_3_FEAT_OUT,
+
+    // Gemma 4 MTP assistant (speculative drafter)
+    LLM_KV_GEMMA4_ASSISTANT_N_CENTROIDS,
+    LLM_KV_GEMMA4_ASSISTANT_CENTROID_TOP_K,
+    LLM_KV_GEMMA4_ASSISTANT_N_EMBD_BACKBONE,
+    LLM_KV_GEMMA4_ASSISTANT_ATTENTION_K_EQ_V,
+    LLM_KV_GEMMA4_ASSISTANT_USE_ORDERED_EMBEDDINGS,
+    LLM_KV_GEMMA4_ASSISTANT_REQUIRES_TARGET_ARCH,
 };
 
 enum llm_tensor {
@@ -555,6 +566,12 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+
+    // Gemma 4 MTP assistant tensors (GGUF prefix: mtp.*)
+    LLM_TENSOR_MTP_PRE_PROJECTION,
+    LLM_TENSOR_MTP_POST_PROJECTION,
+    LLM_TENSOR_MTP_CENTROIDS,
+    LLM_TENSOR_MTP_TOKEN_ORDERING,
 };
 
 enum llm_tensor_layer {
@@ -637,4 +654,4 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
-bool llm_arch_supports_rs_rollback(const llm_arch & arch);
+bool llm_arch_supports_recurrent_partial_rollback(const llm_arch & arch);

@@ -156,7 +156,5 @@ flake.lock
 # emscripten
 a.out.*
 
-# AGENTS
-
-AGENTS.local.md
-.pi/SYSTEM.md
+.history/
+.scratch/

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -121,8 +122,126 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-// returns true on success
-static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model & model, llama_model_params & params) {
+    // loading time will be recalculated after the first eval, so
+    // we take page faults deferred by mmap() into consideration
+    model.t_load_us = 0;
+    time_meas tm(model.t_load_us);
+
+    model.t_start_us = tm.t_start_us;
+
+    try {
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.print_info();
+
+        model.hparams.vocab_only = params.vocab_only;
+        model.hparams.no_alloc   = params.no_alloc;
+
+        try {
+            model.load_arch(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
+        }
+        if (params.override_arch && params.override_arch[0] != '\0') {
+            const llm_arch arch_ov = llm_arch_from_string(std::string(params.override_arch));
+            if (arch_ov == LLM_ARCH_UNKNOWN) {
+                throw std::runtime_error(std::string("override_arch: unknown architecture '") + params.override_arch + "'");
+            }
+            LLAMA_LOG_INFO("%s: override_arch: '%s' -> '%s'\n", __func__,
+                    llm_arch_name(model.arch), params.override_arch);
+            model.arch = arch_ov;
+            // Combined GGUFs (e.g. Qwen3.6 *_MTP.gguf) hold both the full target
+            // backbone and the NextN draft head. When this loader is used to
+            // mount only the draft view, allow the file to retain unused tensors.
+            ml.partial_load = true;
+        }
+        try {
+            model.load_hparams(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (model.arch == LLM_ARCH_CLIP) {
+            throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
+        }
+        try {
+            model.load_vocab(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+        }
+
+        model.load_stats(ml);
+        model.print_info();
+
+        if (params.vocab_only) {
+            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
+            return 0;
+        }
+
+        if (!model.load_tensors(ml)) {
+            return -2;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return -1;
+    }
+
+    return 0;
+}
+
+static struct llama_model * llama_model_load_from_file_impl(
+        struct gguf_context * metadata,
+        llama_model_set_tensor_data_t set_tensor_data,
+        void * set_tensor_data_ud,
+        const std::string & path_model,
+        std::vector<std::string> & splits,
+        FILE * file,
+        struct llama_model_params params) {
+    {
+        int n_sources_defined = 0;
+        if (metadata != nullptr) {
+            n_sources_defined++;
+        }
+        if (!path_model.empty()) {
+            n_sources_defined++;
+        }
+        if (file != nullptr) {
+            n_sources_defined++;
+        }
+        if (n_sources_defined != 1) {
+            LLAMA_LOG_ERROR("%s: exactly one out metadata, path_model, and file must be defined\n", __func__);
+            return nullptr;
+        }
+    }
+    ggml_time_init();
+
+    if (!params.vocab_only && ggml_backend_reg_count() == 0) {
+        LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
+        return nullptr;
+    }
+
+    unsigned cur_percentage = 0;
+    if (params.progress_callback == NULL) {
+        params.progress_callback_user_data = &cur_percentage;
+        params.progress_callback = [](float progress, void * ctx) {
+            unsigned * cur_percentage_p = (unsigned *) ctx;
+            unsigned percentage = (unsigned) (100 * progress);
+            while (percentage > *cur_percentage_p) {
+                *cur_percentage_p = percentage;
+                LLAMA_LOG_CONT(".");
+                if (percentage >= 100) {
+                    LLAMA_LOG_CONT("\n");
+                }
+            }
+            return true;
+        };
+    }
+
+    llama_model * model = new llama_model(params);
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -451,6 +570,123 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     std::string path_model;
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
+}
+
+static bool llama_mtp_vocab_matches(const llama_model & tgt, const llama_model & aux) {
+    const llama_vocab & vt = tgt.vocab;
+    const llama_vocab & va = aux.vocab;
+    if (vt.n_tokens() != va.n_tokens()) {
+        LLAMA_LOG_ERROR("%s: vocab size mismatch (target=%u assistant=%u)\n", __func__, vt.n_tokens(), va.n_tokens());
+        return false;
+    }
+    constexpr int32_t k_check_from = 5; // align with speculative MTP vocab check
+    for (uint32_t i = (uint32_t) k_check_from; i < vt.n_tokens(); ++i) {
+        const llama_token id = (llama_token) i;
+        if (std::strcmp(vt.token_get_text(id), va.token_get_text(id)) != 0) {
+            LLAMA_LOG_ERROR("%s: vocab text mismatch at token id %d\n", __func__, (int) id);
+            return false;
+        }
+    }
+    return true;
+}
+
+int llama_model_load_mtp_from_file(struct llama_model * model, const char * path_mtp, struct llama_model_params params) {
+    if (!model || !path_mtp || !path_mtp[0]) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return -1;
+    }
+
+    llama_model * tgt = (llama_model *) model;
+    if (tgt->arch != LLM_ARCH_GEMMA4) {
+        LLAMA_LOG_ERROR("%s: MTP target must be arch gemma4 (got %s)\n", __func__, llm_arch_name(tgt->arch));
+        return -2;
+    }
+
+    llama_model * aux = llama_model_load_from_file(path_mtp, params);
+    if (!aux) {
+        LLAMA_LOG_ERROR("%s: failed to load assistant from '%s'\n", __func__, path_mtp);
+        return -3;
+    }
+
+    if (aux->arch != LLM_ARCH_GEMMA4_ASSISTANT) {
+        LLAMA_LOG_ERROR("%s: MTP weights must be arch gemma4_assistant (got %s)\n", __func__, llm_arch_name(aux->arch));
+        llama_model_free(aux);
+        return -4;
+    }
+
+    const auto req_it = aux->gguf_kv.find("gemma4_assistant.requires_target_arch");
+    if (req_it != aux->gguf_kv.end() && req_it->second != "gemma4") {
+        LLAMA_LOG_ERROR("%s: assistant requires_target_arch='%s' (expected gemma4)\n", __func__, req_it->second.c_str());
+        llama_model_free(aux);
+        return -5;
+    }
+
+    if (aux->hparams.n_embd_backbone == 0 || aux->hparams.n_embd_backbone != tgt->hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: assistant n_embd_backbone %u must match target n_embd %u\n", __func__,
+                aux->hparams.n_embd_backbone, tgt->hparams.n_embd);
+        llama_model_free(aux);
+        return -6;
+    }
+
+    if (!llama_mtp_vocab_matches(*tgt, *aux)) {
+        llama_model_free(aux);
+        return -7;
+    }
+    // Rename all MTP assistant tensors with "mtp." prefix so they can be
+    // uniquely targeted by -ot rules without colliding with the main model's
+    // tensors. Tensors already prefixed with "mtp." (pre_projection,
+    // post_projection, centroids, token_ordering) are left unchanged.
+    for (auto & kv : aux->tensors_by_name) {
+        if (kv.first.substr(0, 4) != "mtp.") {
+            std::string new_name = "mtp." + kv.first;
+            ggml_set_name(kv.second, new_name.c_str());
+            kv.first = new_name;
+        }
+    }
+    tgt->mtp_assistant.reset(aux);
+    return 0;
+}
+
+const struct llama_model * llama_model_get_mtp_assistant(const struct llama_model * model) {
+    if (!model) {
+        return nullptr;
+    }
+    const llama_model * m = (const llama_model *) model;
+    return m->mtp_assistant.get();
+}
+
+bool llama_model_has_mtp_assistant(const struct llama_model * model) {
+    return llama_model_get_mtp_assistant(model) != nullptr;
+}
+
+uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model) {
+    if (!model) {
+        return 0;
+    }
+    const llama_model * m = (const llama_model *) model;
+    if (!m->mtp_assistant) {
+        return 0;
+    }
+    return m->mtp_assistant->hparams.n_embd_backbone;
+}
+
+bool llama_model_has_nextn_layer(const struct llama_model * model) {
+    if (!model) {
+        return false;
+    }
+    const llama_model * m = (const llama_model *) model;
+    if (m->hparams.nextn_predict_layers == 0) {
+        return false;
+    }
+    return m->arch == LLM_ARCH_QWEN35 || m->arch == LLM_ARCH_QWEN35MOE;
+}
+
+uint32_t llama_model_n_nextn_predict_layers(const struct llama_model * model) {
+    if (!model) {
+        return 0;
+    }
+    const llama_model * m = (const llama_model *) model;
+    return m->hparams.nextn_predict_layers;
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

@@ -1210,6 +1210,43 @@ common_init_result::common_init_result(common_params & params) :
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
+    if (params.speculative.has_dft() && params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+        if (params.speculative.mparams_dft.path.empty() && params.speculative.mparams_dft.hf_repo.empty()) {
+            LOG_ERR("%s: MTP speculative decoding requires --mtp-head or --model-draft with a local path\n", __func__);
+            pimpl->model.reset();
+            return;
+        }
+        if (params.speculative.mparams_dft.path.empty()) {
+            LOG_ERR("%s: MTP assistant must be loaded from a local GGUF path (HF repo download not wired here)\n", __func__);
+            pimpl->model.reset();
+            return;
+        }
+
+        common_params p_mtp = params;
+        p_mtp.n_parallel   = 1;
+        p_mtp.n_ctx        = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_ctx;
+        p_mtp.n_batch      = std::max(p_mtp.n_ctx, params.n_batch);
+        p_mtp.devices      = params.speculative.devices;
+        p_mtp.model        = params.speculative.mparams_dft;
+        p_mtp.n_gpu_layers = params.speculative.n_gpu_layers;
+        p_mtp.cache_type_k = params.speculative.cache_type_k;
+        p_mtp.cache_type_v = params.speculative.cache_type_v;
+        if (params.speculative.cpuparams.n_threads > 0) {
+            p_mtp.cpuparams       = params.speculative.cpuparams;
+            p_mtp.cpuparams_batch = params.speculative.cpuparams_batch;
+        }
+        p_mtp.tensor_buft_overrides = params.speculative.tensor_buft_overrides;
+
+        llama_model_params mparams_mtp = common_model_params_to_llama(p_mtp);
+        const char * path_mtp = params.speculative.mparams_dft.path.c_str();
+        if (llama_model_load_mtp_from_file(model, path_mtp, mparams_mtp) != 0) {
+            LOG_ERR("%s: failed to load MTP assistant from '%s'\n", __func__, path_mtp);
+            pimpl->model.reset();
+            return;
+        }
+        params.speculative.model_dft = nullptr;
+    }
+
     // updates params.sampling
     // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);
@@ -1470,8 +1507,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     }
 
     if (llama_n_rs_seq(ctx) > 0) {
-        LOG_INF("%s: the context supports bounded partial sequence removal\n", __func__);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED;
         goto done;
     }
 
@@ -1562,7 +1598,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    {
+        // TODO: add for MTP
+        const bool has_spec = (params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE)
+                              || params.speculative.has_dft();
+        cparams.n_rs_seq = has_spec ? (uint32_t) params.speculative.n_max : 0u;
+    }
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

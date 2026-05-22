@@ -157,7 +157,6 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
     for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -352,6 +351,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    const uint32_t mem_size  = mctx_cur->get_size();
+    const bool keep_intermediates   = (cparams.n_rs_seq > 0)
+                            && (n_seq_tokens > 1)
+                            && ((uint32_t) n_seq_tokens <= 1 + cparams.n_rs_seq);
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
@@ -384,7 +388,46 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    cb(conv_states, "conv_states_reshaped", il);
+
+    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+    cb(qkv_mixed, "qkv_mixed_transposed", il);
+
+    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    cb(conv_input, "conv_input", il);
+
+    if (!keep_intermediates) {
+        // Update convolution state cache.
+        // Extract the last (conv_kernel_size - 1) states from conv_input
+        ggml_tensor * last_conv_states =
+            ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
+                         conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+        cb(last_conv_states, "last_conv_states", il);
+
+        ggml_tensor * state_update_target =
+            ggml_view_2d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels, n_seqs, conv_states_all->nb[1],
+                         kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
+        cb(state_update_target, "state_update_target", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    } else {
+        // store per-token intermediates
+        const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+        const size_t  row_size  = row_count * ggml_element_size(conv_states_all);
+        for (int64_t t = 1; t <= n_seq_tokens; ++t) {
+            const uint32_t slot = (uint32_t)(n_seq_tokens - t);
+            ggml_tensor * src =
+                ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs,
+                             conv_input->nb[1], conv_input->nb[2],
+                             t * ggml_element_size(conv_input));
+            ggml_tensor * dst =
+                ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
+                             conv_states_all->nb[1],
+                             ((size_t) slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -446,7 +489,54 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output;
+
+    if (!keep_intermediates) {
+        auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+
+        output                  = attn_out.first;
+        ggml_tensor * new_state = attn_out.second;
+        cb(output, "attn_output", il);
+        cb(new_state, "new_state", il);
+
+        // Update the recurrent states (slot 0 only).
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    } else {
+        ggml_tensor * gdn_out = build_delta_net_fused_keep_intermediates(
+            q_conv, k_conv, v_conv, gate, beta, state, il);
+
+        const int64_t S_v = head_v_dim;
+        const int64_t H_v = num_v_heads;
+
+        const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
+        const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
+
+        output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        for (int64_t t = 1; t <= n_seq_tokens; ++t) {
+            const uint32_t slot = (uint32_t)(n_seq_tokens - t);
+            ggml_tensor * src = ggml_view_4d(ctx0, gdn_out,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v * H_v),
+                ggml_row_size(gdn_out->type, attn_score_elems + (t - 1) * state_size_per_snap));
+            ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
+                hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                ((size_t) slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

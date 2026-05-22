@@ -28,7 +28,8 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
-    bool embeddings_pre_norm; // also extract the hidden state before the final output norm
+    bool embeddings_pre_norm; // extract hidden state before final output norm (Qwen NextN draft input)
+    bool nextn_draft;         // this context is the NextN draft side: build LLM_GRAPH_TYPE_NEXTN graphs and reuse the target's llama_model (no second mmap)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

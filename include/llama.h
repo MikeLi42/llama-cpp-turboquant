@@ -317,6 +317,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // if non-NULL, replace architecture from GGUF after read (e.g. load same file as qwen35_mtp for NextN draft)
+        const char * override_arch;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -340,7 +343,7 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
-        uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -383,6 +386,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool nextn_draft; // this context is the Qwen NextN draft side: build the NextN draft graph against the *target* llama_model
+                          // (no second mmap of the combined MTP GGUF). Default false. Set true only for the draft context.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -499,6 +504,28 @@ extern "C" {
                                  size_t    n_paths,
               struct llama_model_params    params);
 
+    // Gemma 4 MTP: load gemma4_assistant GGUF into a gemma4 target (call after llama_model_load_from_file, before llama_init_from_model).
+    // Returns 0 on success.
+    LLAMA_API int llama_model_load_mtp_from_file(
+            struct llama_model * model,
+            const char * path_mtp,
+            struct llama_model_params params);
+
+    LLAMA_API const struct llama_model * llama_model_get_mtp_assistant(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_has_mtp_assistant(const struct llama_model * model);
+
+    // Backbone hidden size for MTP input (0 if no MTP assistant is loaded).
+    LLAMA_API uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model);
+
+    // Qwen NextN: true when the target model was loaded from a combined *_MTP GGUF
+    // (i.e. hparams.nextn_predict_layers > 0) and its arch is one of {qwen35, qwen35moe}.
+    // Drives the shared-model NextN draft path (no second 22 GB mmap).
+    LLAMA_API bool llama_model_has_nextn_layer(const struct llama_model * model);
+
+    // Number of NextN predict layers stored in the target model (0 if none / not supported).
+    LLAMA_API uint32_t llama_model_n_nextn_predict_layers(const struct llama_model * model);
+
     LLAMA_API void llama_model_save_to_file(
             const struct llama_model * model,
                         const char * path_model);
@@ -539,7 +566,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
-    LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_rs_seq       (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -573,6 +600,16 @@ extern "C" {
 
     // Returns label of classifier output by index (<n_cls_out). Returns nullptr if no label provided
     LLAMA_API const char * llama_model_cls_label(const struct llama_model * model, uint32_t i);
+
+    // GGUF "general.architecture" string for the model (e.g. "gemma4", "gemma4_assistant")
+    LLAMA_API const char * llama_model_arch_str(const struct llama_model * model);
+
+    // Copy one token embedding row as f32. Supported for F32/F16 token_embd only. Returns row width or -1.
+    LLAMA_API int32_t llama_model_token_embd_row_f32(
+            const struct llama_model * model,
+            llama_token token,
+            float * out,
+            int32_t n_out);
 
     LLAMA_API enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab);
 
@@ -955,6 +992,61 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Gemma 4 MTP: run up to n_steps greedy assistant steps using target KV and last hidden state.
+    // h_prev must hold n_embd_backbone floats on input; overwritten with the last step's projected hidden on success.
+    // out_logits may be NULL or a row-major buffer of shape [n_steps, n_vocab].
+    // out_h_prev_last may be NULL; if set, receives the same final h as h_prev.
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
+
+    // Async MTP draft pipeline (see plan async-mtp-pipeline). Submits a draft request
+    // to a dedicated worker thread that runs the MTP graph on its own ggml_backend_sched.
+    // This lets the main thread proceed with target verify while MTP encodes in parallel.
+    //
+    // Contract:
+    //   - At most one in-flight request per context. Submitting a second _async without
+    //     calling _wait first returns -7 (and leaves the previous request in flight).
+    //   - h_prev must hold n_embd_backbone floats; the buffer is copied into the request,
+    //     so the caller may free or modify it after _async returns.
+    //   - The caller must guarantee that target KV positions ≤ attn_pos remain stable
+    //     until _wait returns. With the current append-only KV cache this is implicitly
+    //     true as long as no cache eviction is triggered between _async and _wait.
+    LLAMA_API int32_t llama_decode_mtp_async(
+            struct llama_context * ctx,
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            const float * h_prev,
+            int32_t       n_steps);
+
+    // Block until the in-flight MTP request completes. Copies up to n_steps drafts into
+    // out_drafts and the last hidden state into out_h_prev_last (may be NULL).
+    LLAMA_API int32_t llama_decode_mtp_wait(
+            struct llama_context * ctx,
+            llama_token * out_drafts,
+            float       * out_h_prev_last);
+
+    // Qwen NextN (second-context draft): pair target `ctx` with a draft head context built from the same GGUF.
+    // Gemma 4 MTP APIs above are unchanged.
+    LLAMA_API void llama_set_nextn(
+            struct llama_context * ctx_target,
+            struct llama_context * ctx_nextn);
+
+    // Remove KV on both target and NextN draft contexts (draft uses seq_id 0).
+    LLAMA_API bool llama_context_nextn_seq_rm(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              p0,
+            llama_pos              p1);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1000,6 +1092,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Dense LM-head logits row for batch position i ([n_vocab], no backend sampling view).
+    // Prefer this for greedy speculative verification; llama_get_logits_ith() may return
+    // sparse / backend-sampled buffers that change argmax.
+    // Returns NULL if logits are unavailable for this index.
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

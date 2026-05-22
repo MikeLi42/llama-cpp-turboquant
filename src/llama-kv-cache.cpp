@@ -1050,6 +1050,38 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
+llama_kv_cache::slot_info llama_kv_cache::mtp_slot_info(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t st    = seq_to_stream[seq_id];
+    const auto &   cells = v_cells[st];
+
+    llama_pos pmax = cells.seq_pos_max(seq_id);
+
+    uint32_t idx = 0;
+
+    if (pmax >= 0) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            if (cells.pos_get(i) == pmax) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
+    slot_info res;
+    res.s0   = 0;
+    res.s1   = 0;
+    res.strm = { (llama_seq_id) st };
+    res.idxs.resize(1);
+    res.idxs[0] = { idx };
+
+    return res;
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
     if (debug > 0) {
@@ -1344,6 +1376,8 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::get_has_shift() const {
+    // TurboQuant uses kernel-level WHT rotation -- position shift is a no-op
+    if (!layers.empty() && (layers[0].k->type == GGML_TYPE_TURBO2_0 || layers[0].k->type == GGML_TYPE_TURBO3_0 || layers[0].k->type == GGML_TYPE_TURBO4_0)) { return false; }
     bool result = false;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2108,6 +2142,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        const bool is_turbo_k = (layer.k->type == GGML_TYPE_TURBO2_0 || layer.k->type == GGML_TYPE_TURBO3_0 || layer.k->type == GGML_TYPE_TURBO4_0);
+        if (is_turbo_k) { continue; }
 
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -2685,6 +2721,14 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    // Pre-compute n_kv so read-only paths (e.g. MTP draft, which calls process_ubatch with
+    // apply_mctx=false) get a valid mask/K/V shape based on current cache occupancy.
+    // For paths that DO call apply(), n_kv is re-derived there after apply_ubatch().
+    if (!this->sinfos.empty()) {
+        n_kv = (int32_t) kv->get_n_kv(this->sinfos[0]);
+    } else {
+        n_kv = 0;
+    }
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
